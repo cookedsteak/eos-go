@@ -4,6 +4,12 @@ import (
 	"crypto/sha256"
 	"fmt"
 
+	"os"
+
+	"bufio"
+
+	"strings"
+
 	"github.com/eoscanada/eos-go/ecc"
 )
 
@@ -62,7 +68,7 @@ func (s *WalletSigner) Sign(tx *SignedTransaction, chainID []byte, requiredKeys 
 
 // KeyBag holds private keys in memory, for signing transactions.
 type KeyBag struct {
-	Keys []*ecc.PrivateKey
+	Keys []*ecc.PrivateKey `json:"keys"`
 }
 
 func NewKeyBag() *KeyBag {
@@ -80,6 +86,29 @@ func (b *KeyBag) Add(wifKey string) error {
 	return nil
 }
 
+func (b *KeyBag) ImportFromFile(path string) error {
+	inFile, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("import keys from file [%s], %s", path, err)
+	}
+	defer inFile.Close()
+	scanner := bufio.NewScanner(inFile)
+	scanner.Split(bufio.ScanLines)
+
+	for scanner.Scan() {
+		key := strings.TrimSpace(strings.Split(scanner.Text(), " ")[0])
+
+		if strings.Contains(key, "/") || strings.Contains(key, "#") || strings.Contains(key, ";") {
+			return fmt.Errorf("lines should consist of a private key on each line, with an optional whitespace and comment")
+		}
+
+		if err := b.Add(key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (b *KeyBag) AvailableKeys() (out []ecc.PublicKey, err error) {
 	for _, k := range b.Keys {
 		out = append(out, k.PublicKey())
@@ -91,12 +120,24 @@ func (b *KeyBag) ImportPrivateKey(wifPrivKey string) (err error) {
 	return b.Add(wifPrivKey)
 }
 
+func (b *KeyBag) SignDigest(digest []byte, requiredKey ecc.PublicKey) (ecc.Signature, error) {
+
+	privateKey := b.keyMap()[requiredKey.String()]
+	if privateKey == nil {
+		return ecc.Signature{}, fmt.Errorf("private key not found for public key [%s]", requiredKey.String())
+	}
+
+	return privateKey.Sign(digest)
+}
+
 func (b *KeyBag) Sign(tx *SignedTransaction, chainID []byte, requiredKeys ...ecc.PublicKey) (*SignedTransaction, error) {
 	// TODO: probably want to use `tx.packed` and hash the ContextFreeData also.
-	txdata, err := MarshalBinary(tx.Transaction)
+	txdata, cfd, err := tx.PackedTransactionAndCFD()
 	if err != nil {
 		return nil, err
 	}
+
+	sigDigest := SigDigest(chainID, txdata, cfd)
 
 	keyMap := b.keyMap()
 	for _, key := range requiredKeys {
@@ -105,17 +146,22 @@ func (b *KeyBag) Sign(tx *SignedTransaction, chainID []byte, requiredKeys ...ecc
 			return nil, fmt.Errorf("private key for %q not in keybag", key)
 		}
 
-		// TODO: handle ContextFreeData later.. will be added to
-		// signature if it exists in tx.ContextFreeData .. and there
-		// can be many []byte in there.. so the serialization isn't
-		// clear to me yet.  Shouldn't be very complex though.
-		sig, err := privKey.Sign(SigDigest(chainID, txdata, []byte{0x00}))
+		// fmt.Println("Signing with", key.String(), privKey.String())
+		// fmt.Println("SIGNING THIS DIGEST:", hex.EncodeToString(sigDigest))
+		// fmt.Println("SIGNING THIS payload:", hex.EncodeToString(txdata))
+		// fmt.Println("SIGNING THIS chainID:", hex.EncodeToString(chainID))
+		// fmt.Println("SIGNING THIS cfd:", hex.EncodeToString(cfd))
+		sig, err := privKey.Sign(sigDigest)
 		if err != nil {
 			return nil, err
 		}
 
-		tx.Signatures = append(tx.Signatures, sig.String())
+		tx.Signatures = append(tx.Signatures, sig)
 	}
+
+	// tmpcnt, _ := json.Marshal(tx)
+	// var newTx *SignedTransaction
+	// _ = json.Unmarshal(tmpcnt, &newTx)
 
 	return tx, nil
 }
@@ -130,10 +176,19 @@ func (b *KeyBag) keyMap() map[string]*ecc.PrivateKey {
 
 func SigDigest(chainID, payload, contextFreeData []byte) []byte {
 	h := sha256.New()
-	_, _ = h.Write(chainID)
+	if len(chainID) == 0 {
+		_, _ = h.Write(make([]byte, 32, 32))
+	} else {
+		_, _ = h.Write(chainID)
+	}
 	_, _ = h.Write(payload)
+
 	if len(contextFreeData) > 0 {
-		_, _ = h.Write(contextFreeData)
+		h2 := sha256.New()
+		_, _ = h2.Write(contextFreeData)
+		_, _ = h.Write(h2.Sum(nil)) // add the hash of CFD to the payload
+	} else {
+		_, _ = h.Write(make([]byte, 32, 32))
 	}
 	return h.Sum(nil)
 }

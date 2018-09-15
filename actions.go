@@ -1,20 +1,12 @@
 package eos
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"reflect"
 )
-
-var registeredActions = map[AccountName]map[ActionName]reflect.Type{}
-
-// Registers Action objects..
-func RegisterAction(accountName AccountName, actionName ActionName, obj interface{}) {
-	// TODO: lock or som'th.. unless we never call after boot time..
-	if registeredActions[accountName] == nil {
-		registeredActions[accountName] = make(map[ActionName]reflect.Type)
-	}
-	registeredActions[accountName][actionName] = reflect.ValueOf(obj).Type()
-}
 
 // See: libraries/chain/include/eosio/chain/contracts/types.hpp:203
 // See: build/contracts/eosio.system/eosio.system.abi
@@ -33,58 +25,134 @@ type SetABI struct {
 	ABI     ABI         `json:"abi"`
 }
 
-// NewAccount represents the hard-coded `newaccount` action.
-type NewAccount struct {
-	Creator  AccountName `json:"creator"`
-	Name     AccountName `json:"name"`
-	Owner    Authority   `json:"owner"`
-	Active   Authority   `json:"active"`
-	Recovery Authority   `json:"recovery"`
-}
-
 // Action
 type Action struct {
 	Account       AccountName       `json:"account"`
 	Name          ActionName        `json:"name"`
 	Authorization []PermissionLevel `json:"authorization,omitempty"`
-	Data          ActionData        `json:"data"` // as HEX when we receive it.. FIXME: decode from hex directly.. and encode back plz!
+	ActionData
 }
 
-func (a Action) Obj() interface{} { // Payload ? ActionData ? GetData ?
-	return a.Data.obj
+func (a Action) Digest() SHA256Bytes {
+	toEat := jsonActionToServer{
+		Account:       a.Account,
+		Name:          a.Name,
+		Authorization: a.Authorization,
+		Data:          a.ActionData.HexData,
+	}
+	bin, err := MarshalBinary(toEat)
+	if err != nil {
+		panic("this should never panic, we know it marshals properly all the time")
+	}
+
+	h := sha256.New()
+	_, _ = h.Write(bin)
+	return h.Sum(nil)
 }
 
 type ActionData struct {
-	HexBytes
-	obj interface{} // potentially unpacked from the Actions registry mapped through `RegisterAction`.
-	abi []byte      // TBD: we could use the ABI to decode in obj
+	HexData  HexBytes    `json:"hex_data,omitempty"`
+	Data     interface{} `json:"data,omitempty" eos:"-"`
+	abi      []byte      // TBD: we could use the ABI to decode in obj
+	toServer bool
 }
 
 func NewActionData(obj interface{}) ActionData {
-	return ActionData{obj: obj}
+	return ActionData{
+		HexData:  []byte{},
+		Data:     obj,
+		toServer: true,
+	}
 }
 
-func (a ActionData) MarshalBinary() ([]byte, error) {
-	if a.obj != nil {
-		raw, err := MarshalBinary(a.obj)
+func NewActionDataFromHexData(data []byte) ActionData {
+	return ActionData{
+		HexData:  data,
+		Data:     nil,
+		toServer: true,
+	}
+}
+
+func (a *ActionData) SetToServer(toServer bool) {
+	// FIXME: let's clarify this design, make it simpler..
+	// toServer doesn't speak of the intent..
+	a.toServer = toServer
+}
+
+//  jsonActionToServer represents what /v1/chain/push_transaction
+//  expects, which isn't allllways the same everywhere.
+type jsonActionToServer struct {
+	Account       AccountName       `json:"account"`
+	Name          ActionName        `json:"name"`
+	Authorization []PermissionLevel `json:"authorization,omitempty"`
+	Data          HexBytes          `json:"data,omitempty"`
+}
+
+type jsonActionFromServer struct {
+	Account       AccountName       `json:"account"`
+	Name          ActionName        `json:"name"`
+	Authorization []PermissionLevel `json:"authorization,omitempty"`
+	Data          interface{}       `json:"data,omitempty"`
+	HexData       HexBytes          `json:"hex_data,omitempty"`
+}
+
+func (a *Action) MarshalJSON() ([]byte, error) {
+	println(fmt.Sprintf("MarshalJSON toServer? %t", a.toServer))
+
+	if a.toServer {
+		data, err := a.ActionData.EncodeActionData()
 		if err != nil {
 			return nil, err
 		}
-		a.HexBytes = HexBytes(raw)
+
+		println("MarshalJSON data length : ", len(data)) /**/
+
+		return json.Marshal(&jsonActionToServer{
+			Account:       a.Account,
+			Name:          a.Name,
+			Authorization: a.Authorization,
+			Data:          data,
+		})
 	}
-	return MarshalBinary(a.HexBytes)
+
+	return json.Marshal(&jsonActionFromServer{
+		Account:       a.Account,
+		Name:          a.Name,
+		Authorization: a.Authorization,
+		HexData:       a.HexData,
+		Data:          a.Data,
+	})
 }
 
-func (a *ActionData) UnmarshalBinaryWithLastAction(data []byte, act Action) error {
-	a.HexBytes = HexBytes(data)
+func (data *ActionData) EncodeActionData() ([]byte, error) {
+	if data.Data == nil {
+		return data.HexData, nil
+	}
 
-	actionMap := registeredActions[act.Account]
+	buf := new(bytes.Buffer)
+	encoder := NewEncoder(buf)
+
+	println("MarshalJSON, encoding action data to binary")
+	if err := encoder.Encode(data.Data); err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
+}
+
+func (a *Action) MapToRegisteredAction() error {
+	src, ok := a.ActionData.Data.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+
+	actionMap := RegisteredActions[a.Account]
 
 	var decodeInto reflect.Type
 	if actionMap != nil {
-		objType := actionMap[act.Name]
+		objType := actionMap[a.Name]
 		if objType != nil {
-			decodeInto = reflect.TypeOf(objType)
+			decodeInto = objType
 		}
 	}
 	if decodeInto == nil {
@@ -92,90 +160,18 @@ func (a *ActionData) UnmarshalBinaryWithLastAction(data []byte, act Action) erro
 	}
 
 	obj := reflect.New(decodeInto)
+	objIface := obj.Interface()
 
-	err := UnmarshalBinary(data, &obj)
+	cnt, err := json.Marshal(src)
 	if err != nil {
-		return err
+		return fmt.Errorf("marshaling data: %s", err)
 	}
-
-	a.obj = obj.Elem().Interface()
-
-	return nil
-}
-
-func (a *ActionData) UnmarshalJSON(v []byte) (err error) {
-	// Unmarshal from the JSON format ?  We'd need it to be registered.. but we can't hook into the JSON
-	// lib to read the current action above.. we'll need to defer loading
-	// Either keep as json.RawMessage, or as map[string]interface{}
-	a.obj = json.RawMessage(v)
-	return nil
-}
-
-// DecodeAs allows you to decode after the fact, either from JSON or from HexBytes
-func (a *Action) DecodeAs(v interface{}) (err error) {
-	if msg, ok := a.Data.obj.(json.RawMessage); ok {
-		err = json.Unmarshal(msg, v)
-	} else {
-		err = UnmarshalBinary(a.Data.HexBytes, v)
-	} // Fail with an error if HexBytes was len=0 ?
-	// Perhaps it was already decoded into something Registered!
+	err = json.Unmarshal(cnt, objIface)
 	if err != nil {
-		return err
+		return fmt.Errorf("json unmarshal into registered actions: %s", err)
 	}
 
-	a.Data.obj = v
+	a.ActionData.Data = objIface
 
 	return nil
-
-}
-
-func (a ActionData) MarshalJSON() ([]byte, error) {
-	return json.Marshal(a.obj)
-}
-
-type jsonAction struct {
-	Account       AccountName       `json:"account"`
-	Name          ActionName        `json:"name"`
-	Authorization []PermissionLevel `json:"authorization,omitempty"`
-	Data          HexBytes          `json:"data"`
-}
-
-func (a *Action) UnmarshalJSON(v []byte) (err error) {
-	// load Account, Name, Authorization, Data
-	// and then unpack other fields in a struct based on `Name` and `AccountName`..
-	var newAct jsonAction
-	if err = json.Unmarshal(v, &newAct); err != nil {
-		return
-	}
-
-	a.Account = newAct.Account
-	a.Name = newAct.Name
-	a.Authorization = newAct.Authorization
-
-	err = UnmarshalBinaryWithAction([]byte(newAct.Data), &a.Data, *a)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (a *Action) MarshalJSON() ([]byte, error) {
-	var data HexBytes
-	if a.Data.obj == nil {
-		data = a.Data.HexBytes
-	} else {
-		var err error
-		data, err = MarshalBinary(a.Data.obj)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	return json.Marshal(&jsonAction{
-		Account:       a.Account,
-		Name:          a.Name,
-		Authorization: a.Authorization,
-		Data:          HexBytes(data),
-	})
 }

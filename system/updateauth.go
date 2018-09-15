@@ -14,58 +14,25 @@ func NewUpdateAuth(account eos.AccountName, permission, parent eos.PermissionNam
 		Authorization: []eos.PermissionLevel{
 			{account, usingPermission},
 		},
-		Data: eos.NewActionData(UpdateAuth{
+		ActionData: eos.NewActionData(UpdateAuth{
 			Account:    account,
 			Permission: permission,
 			Parent:     parent,
-			Data:       authority,
+			Auth:       authority,
 		}),
 	}
 
 	return a
 }
 
-/**
-
-42a3be5a00000100e543ae35
-0000
-0000
-00
-02
-
-ACTION 1
-0000000000ea3055 eosio
-0040cbdaa86c52d5 updateauth
-01
-0000000000ea3055 eosio
-00000000a8ed3232 active
-1e len
-0000000000ea3055 eosio
-00000000a8ed3232 active
-0000000080ab26a7 owner
-00000000  threshold
-00
-00
-
-ACTION 2
-0000000000ea3055 eosio
-0040cbdaa86c52d5 updateauth
-01
-0000000000ea3055
-00000000a8ed3232
-1e len
-0000000000ea3055 eosio
-0000000080ab26a7 owner
-0000000000000000 NONE (parent empty)
-00000000
-00
-00
-
-
-0000000000ea3055 eosio
-00000000a8ed3232 active
-0000000080ab26a7 owner
-00000000
-00
-00
-*/
+// UpdateAuth represents the hard-coded `updateauth` action.
+//
+// If you change the `active` permission, `owner` is the required parent.
+//
+// If you change the `owner` permission, there should be no parent.
+type UpdateAuth struct {
+	Account    eos.AccountName    `json:"account"`
+	Permission eos.PermissionName `json:"permission"`
+	Parent     eos.PermissionName `json:"parent"`
+	Auth       eos.Authority      `json:"auth"`
+}

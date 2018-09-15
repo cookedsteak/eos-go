@@ -9,10 +9,17 @@ func NewIssue(to eos.AccountName, quantity eos.Asset, memo string) *eos.Action {
 		Authorization: []eos.PermissionLevel{
 			{Actor: AN("eosio"), Permission: PN("active")},
 		},
-		Data: eos.NewActionData(Issue{
+		ActionData: eos.NewActionData(Issue{
 			To:       to,
 			Quantity: quantity,
 			Memo:     memo,
 		}),
 	}
+}
+
+// Issue represents the `issue` struct on the `eosio.token` contract.
+type Issue struct {
+	To       eos.AccountName `json:"to"`
+	Quantity eos.Asset       `json:"quantity"`
+	Memo     string          `json:"memo"`
 }

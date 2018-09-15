@@ -4,8 +4,9 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -21,63 +22,48 @@ type AccountName Name
 type PermissionName Name
 type ActionName Name
 type TableName Name
+type ScopeName Name
 
 func AN(in string) AccountName    { return AccountName(in) }
 func ActN(in string) ActionName   { return ActionName(in) }
 func PN(in string) PermissionName { return PermissionName(in) }
 
-func (acct AccountName) MarshalBinary() ([]byte, error) {
-	return Name(acct).MarshalBinary()
-}
-func (acct PermissionName) MarshalBinary() ([]byte, error) {
-	return Name(acct).MarshalBinary()
-}
-func (acct ActionName) MarshalBinary() ([]byte, error) {
-	return Name(acct).MarshalBinary()
-}
-func (acct TableName) MarshalBinary() ([]byte, error) {
-	return Name(acct).MarshalBinary()
-}
-func (acct Name) MarshalBinary() ([]byte, error) {
-	val, err := StringToName(string(acct))
-	if err != nil {
-		return nil, err
-	}
-	var out [8]byte
-	binary.LittleEndian.PutUint64(out[:8], val)
-	return out[:], nil
+type AccountResourceLimit struct {
+	Used      JSONInt64 `json:"used"`
+	Available JSONInt64 `json:"available"`
+	Max       JSONInt64 `json:"max"`
 }
 
-func (n *AccountName) UnmarshalBinary(data []byte) error {
-	*n = AccountName(NameToString(binary.LittleEndian.Uint64(data)))
-	return nil
-}
-func (n *Name) UnmarshalBinary(data []byte) error {
-	*n = Name(NameToString(binary.LittleEndian.Uint64(data)))
-	return nil
-}
-func (n *PermissionName) UnmarshalBinary(data []byte) error {
-	*n = PermissionName(NameToString(binary.LittleEndian.Uint64(data)))
-	return nil
-}
-func (n *ActionName) UnmarshalBinary(data []byte) error {
-	*n = ActionName(NameToString(binary.LittleEndian.Uint64(data)))
-	return nil
-}
-func (n *TableName) UnmarshalBinary(data []byte) error {
-	*n = TableName(NameToString(binary.LittleEndian.Uint64(data)))
-	return nil
+type DelegatedBandwidth struct {
+	From      AccountName `json:"from"`
+	To        AccountName `json:"to"`
+	NetWeight Asset       `json:"net_weight"`
+	CPUWeight Asset       `json:"cpu_weight"`
 }
 
-func (AccountName) UnmarshalBinarySize() int    { return 8 }
-func (PermissionName) UnmarshalBinarySize() int { return 8 }
-func (ActionName) UnmarshalBinarySize() int     { return 8 }
-func (TableName) UnmarshalBinarySize() int      { return 8 }
-func (Name) UnmarshalBinarySize() int           { return 8 }
+type TotalResources struct {
+	Owner     AccountName `json:"owner"`
+	NetWeight Asset       `json:"net_weight"`
+	CPUWeight Asset       `json:"cpu_weight"`
+	RAMBytes  JSONInt64   `json:"ram_bytes"`
+}
 
-// OTHER TYPES: eosjs/src/structs.js
+type VoterInfo struct {
+	Owner             AccountName   `json:"owner"`
+	Proxy             AccountName   `json:"proxy"`
+	Producers         []AccountName `json:"producers"`
+	Staked            JSONInt64     `json:"staked"`
+	LastVoteWeight    JSONFloat64   `json:"last_vote_weight"`
+	ProxiedVoteWeight JSONFloat64   `json:"proxied_vote_weight"`
+	IsProxy           byte          `json:"is_proxy"`
+}
 
-// Compression
+type RefundRequest struct {
+	Owner       AccountName `json:"owner"`
+	RequestTime JSONTime    `json:"request_time"` //         {"name":"request_time", "type":"time_point_sec"},
+	NetAmount   Asset       `json:"net_amount"`
+	CPUAmount   Asset       `json:"cpu_amount"`
+}
 
 type CompressionType uint8
 
@@ -102,7 +88,13 @@ func (c CompressionType) MarshalJSON() ([]byte, error) {
 }
 
 func (c *CompressionType) UnmarshalJSON(data []byte) error {
-	switch string(data) {
+	var s string
+	err := json.Unmarshal(data, &s)
+	if err != nil {
+		return err
+	}
+
+	switch s {
 	case "zlib":
 		*c = CompressionZlib
 	default:
@@ -115,17 +107,24 @@ func (c *CompressionType) UnmarshalJSON(data []byte) error {
 
 type CurrencyName string
 
-func (c CurrencyName) MarshalBinary() ([]byte, error) {
-	out := make([]byte, 7, 7)
-	copy(out, []byte(c))
-	return out, nil
-}
+type Bool bool
 
-func (c *CurrencyName) UnmarshalBinary(data []byte) error {
-	*c = CurrencyName(strings.TrimRight(string(data), "\x00"))
+func (b *Bool) UnmarshalJSON(data []byte) error {
+	var num int
+	err := json.Unmarshal(data, &num)
+	if err == nil {
+		*b = Bool(num != 0)
+		return nil
+	}
+
+	var boolVal bool
+	if err := json.Unmarshal(data, &boolVal); err != nil {
+		return fmt.Errorf("couldn't unmarshal bool as int or true/false: %s", err)
+	}
+
+	*b = Bool(boolVal)
 	return nil
 }
-func (CurrencyName) UnmarshalBinarySize() int { return 7 }
 
 // Asset
 
@@ -133,6 +132,44 @@ func (CurrencyName) UnmarshalBinarySize() int { return 7 }
 type Asset struct {
 	Amount int64
 	Symbol
+}
+
+func (a Asset) Add(other Asset) Asset {
+	if a.Symbol != other.Symbol {
+		panic("Add applies only to assets with the same symbol")
+	}
+	return Asset{Amount: a.Amount + other.Amount, Symbol: a.Symbol}
+}
+
+func (a Asset) Sub(other Asset) Asset {
+	if a.Symbol != other.Symbol {
+		panic("Sub applies only to assets with the same symbol")
+	}
+	return Asset{Amount: a.Amount - other.Amount, Symbol: a.Symbol}
+}
+
+func (a Asset) String() string {
+	amt := a.Amount
+	if amt < 0 {
+		amt = -amt
+	}
+	strInt := fmt.Sprintf("%d", amt)
+	if len(strInt) < int(a.Symbol.Precision+1) {
+		// prepend `0` for the difference:
+		strInt = strings.Repeat("0", int(a.Symbol.Precision+uint8(1))-len(strInt)) + strInt
+	}
+
+	var result string
+	if a.Symbol.Precision == 0 {
+		result = strInt
+	} else {
+		result = strInt[:len(strInt)-int(a.Symbol.Precision)] + "." + strInt[len(strInt)-int(a.Symbol.Precision):]
+	}
+	if a.Amount < 0 {
+		result = "-" + result
+	}
+
+	return fmt.Sprintf("%s %s", result, a.Symbol.Symbol)
 }
 
 // NOTE: there's also a new ExtendedSymbol (which includes the contract (as AccountName) on which it is)
@@ -146,11 +183,35 @@ type Symbol struct {
 var EOSSymbol = Symbol{Precision: 4, Symbol: "EOS"}
 
 func NewEOSAssetFromString(amount string) (out Asset, err error) {
+	if len(amount) == 0 {
+		return out, fmt.Errorf("cannot be an empty string")
+	}
+
+	if strings.Contains(amount, " EOS") {
+		amount = strings.Replace(amount, " EOS", "", 1)
+	}
+	if !strings.Contains(amount, ".") {
+		val, err := strconv.ParseInt(amount, 10, 64)
+		if err != nil {
+			return out, err
+		}
+		return NewEOSAsset(val * 10000), nil
+	}
+
+	parts := strings.Split(amount, ".")
+	if len(parts) != 2 {
+		return out, fmt.Errorf("cannot have two . in amount")
+	}
+
+	if len(parts[1]) > 4 {
+		return out, fmt.Errorf("EOS has only 4 decimals")
+	}
+
 	val, err := strconv.ParseInt(strings.Replace(amount, ".", "", 1), 10, 64)
 	if err != nil {
 		return out, err
 	}
-	return NewEOSAsset(val), nil
+	return NewEOSAsset(val * int64(math.Pow10(4-len(parts[1])))), nil
 }
 
 func NewEOSAsset(amount int64) Asset {
@@ -186,35 +247,6 @@ func NewAsset(in string) (out Asset, err error) {
 	return
 }
 
-func (a *Asset) UnmarshalBinary(data []byte) error {
-	newAsset := Asset{}
-	if err := UnmarshalBinary(data[:8], &newAsset.Amount); err != nil {
-		return err
-	}
-	if err := UnmarshalBinary(data[8:9], &newAsset.Precision); err != nil {
-		return err
-	}
-	newAsset.Symbol.Symbol = strings.Trim(string(data[9:16]), "\x00")
-
-	*a = newAsset
-
-	return nil
-}
-
-func (Asset) UnmarshalBinarySize() int {
-	return 16
-}
-
-func (a Asset) MarshalBinary() ([]byte, error) {
-	binAsset := struct {
-		Amount    int64
-		Precision uint8
-		Symbol    [7]byte
-	}{Amount: a.Amount, Precision: a.Precision, Symbol: [7]byte{}}
-	copy(binAsset.Symbol[:], []byte(a.Symbol.Symbol))
-	return MarshalBinary(binAsset)
-}
-
 func (a *Asset) UnmarshalJSON(data []byte) error {
 	var s string
 	err := json.Unmarshal(data, &s)
@@ -232,6 +264,10 @@ func (a *Asset) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+func (a Asset) MarshalJSON() (data []byte, err error) {
+	return json.Marshal(a.String())
+}
+
 type Permission struct {
 	PermName     string    `json:"perm_name"`
 	Parent       string    `json:"parent"`
@@ -243,27 +279,85 @@ type PermissionLevel struct {
 	Permission PermissionName `json:"permission"`
 }
 
+// NewPermissionLevel parses strings like `account@active`,
+// `otheraccount@owner` and builds a PermissionLevel struct. It
+// validates that there is a single optional @ (where permission
+// defaults to 'active'), and validates length of account and
+// permission names.
+func NewPermissionLevel(in string) (out PermissionLevel, err error) {
+	parts := strings.Split(in, "@")
+	if len(parts) > 2 {
+		return out, fmt.Errorf("permission %q invalid, use account[@permission]", in)
+	}
+
+	if len(parts[0]) > 12 {
+		return out, fmt.Errorf("account name %q too long", parts[0])
+	}
+
+	out.Actor = AccountName(parts[0])
+	out.Permission = PermissionName("active")
+	if len(parts) == 2 {
+		if len(parts[1]) > 12 {
+			return out, fmt.Errorf("permission %q name too long", parts[1])
+		}
+
+		out.Permission = PermissionName(parts[1])
+	}
+
+	return
+}
+
 type PermissionLevelWeight struct {
 	Permission PermissionLevel `json:"permission"`
-	Weight     uint16          `json:"weight"`
+	Weight     uint16          `json:"weight"` // weight_type
 }
 
 type Authority struct {
 	Threshold uint32                  `json:"threshold"`
-	Keys      []KeyWeight             `json:"keys"`
-	Accounts  []PermissionLevelWeight `json:"accounts"`
+	Keys      []KeyWeight             `json:"keys,omitempty"`
+	Accounts  []PermissionLevelWeight `json:"accounts,omitempty"`
+	Waits     []WaitWeight            `json:"waits,omitempty"`
 }
 
 type KeyWeight struct {
-	PublicKey ecc.PublicKey `json:"public_key"`
-	Weight    uint16        `json:"weight"`
+	PublicKey ecc.PublicKey `json:"key"`
+	Weight    uint16        `json:"weight"` // weight_type
 }
 
-type Code struct {
+type WaitWeight struct {
+	WaitSec uint32 `json:"wait_sec"`
+	Weight  uint16 `json:"weight"` // weight_type
+}
+
+type GetRawCodeAndABIResp struct {
+	AccountName  AccountName `json:"account_name"`
+	WASMasBase64 string      `json:"wasm"`
+	ABIasBase64  string      `json:"abi"`
+}
+
+type GetCodeResp struct {
 	AccountName AccountName `json:"account_name"`
 	CodeHash    string      `json:"code_hash"`
-	WAST        string      `json:"wast"` // TODO: decode into Go ast, see https://github.com/go-interpreter/wagon
+	WASM        string      `json:"wasm"`
 	ABI         ABI         `json:"abi"`
+}
+
+type GetCodeHashResp struct {
+	AccountName AccountName `json:"account_name"`
+	CodeHash    string      `json:"code_hash"`
+}
+
+type GetABIResp struct {
+	AccountName AccountName `json:"account_name"`
+	ABI         ABI         `json:"abi"`
+}
+
+type ABIJSONToBinResp struct {
+	Binargs string `json:"binargs"`
+}
+
+type ABIBinToJSONResp struct {
+	Args M `json:"args"`
 }
 
 // JSONTime
@@ -286,19 +380,6 @@ func (t *JSONTime) UnmarshalJSON(data []byte) (err error) {
 	t.Time, err = time.Parse(`"`+JSONTimeFormat+`"`, string(data))
 	return err
 }
-
-func (t *JSONTime) UnmarshalBinary(data []byte) error {
-	t.Time = time.Unix(int64(binary.LittleEndian.Uint32(data)), 0).UTC()
-	return nil
-}
-
-func (t JSONTime) MarshalBinary() ([]byte, error) {
-	out := []byte{0, 0, 0, 0}
-	binary.LittleEndian.PutUint32(out, uint32(t.Unix()))
-	return out, nil
-}
-
-func (t JSONTime) UnmarshalBinarySize() int { return 4 }
 
 // HexBytes
 
@@ -337,26 +418,11 @@ func (t *SHA256Bytes) UnmarshalJSON(data []byte) (err error) {
 	*t, err = hex.DecodeString(s)
 	return
 }
-
-// TODO: SHA256Bytes, implement the Binary encoder... fixed size.
+func (t SHA256Bytes) String() string {
+	return hex.EncodeToString(t)
+}
 
 type Varuint32 uint32
-
-func (a Varuint32) MarshalBinary() ([]byte, error) {
-	data := make([]byte, 8, 8)
-	l := binary.PutUvarint(data, uint64(a))
-	//fmt.Println("VARUINT MARSHAL", a, data, data[:l])
-	return data[:l], nil
-}
-
-func (a *Varuint32) UnmarshalBinaryRead(r io.Reader) error {
-	size, err := binary.ReadUvarint(&ByteReader{r})
-	if err != nil {
-		return err
-	}
-	*a = Varuint32(size)
-	return nil
-}
 
 // Tstamp
 
@@ -387,25 +453,108 @@ func (t *Tstamp) UnmarshalJSON(data []byte) (err error) {
 			return err
 		}
 	}
-	seconds := unixNano / 1e9
-	nanoSecs := unixNano*1e9 - seconds
-	*t = Tstamp{time.Unix(seconds, nanoSecs)}
+
+	*t = Tstamp{time.Unix(0, unixNano)}
 
 	return nil
 }
 
-func (t *Tstamp) UnmarshalBinary(data []byte) error {
-	unixNano := int64(binary.LittleEndian.Uint64(data))
-	seconds := unixNano / 1e9
-	nanoSecs := unixNano*1e9 - seconds
-	t.Time = time.Unix(seconds, nanoSecs).UTC()
+// BlockNum extracts the block number (or height) from a hex-encoded block ID.
+func BlockNum(blockID string) uint32 {
+	if len(blockID) < 8 {
+		return 0
+	}
+	bin, err := hex.DecodeString(blockID[:8])
+	if err != nil {
+		return 0
+	}
+	return binary.BigEndian.Uint32(bin)
+}
+
+type BlockTimestamp struct {
+	time.Time
+}
+
+const BlockTimestampFormat = "2006-01-02T15:04:05"
+
+func (t BlockTimestamp) MarshalJSON() ([]byte, error) {
+	return []byte(fmt.Sprintf("%q", t.Format(BlockTimestampFormat))), nil
+}
+
+func (t *BlockTimestamp) UnmarshalJSON(data []byte) (err error) {
+	if string(data) == "null" {
+		return nil
+	}
+
+	t.Time, err = time.Parse(`"`+BlockTimestampFormat+`"`, string(data))
+	if err != nil {
+		t.Time, err = time.Parse(`"`+BlockTimestampFormat+`Z07:00"`, string(data))
+	}
+	return err
+}
+
+type JSONFloat64 float64
+
+func (f *JSONFloat64) UnmarshalJSON(data []byte) error {
+	if len(data) == 0 {
+		return errors.New("empty value")
+	}
+
+	if data[0] == '"' {
+		var s string
+		if err := json.Unmarshal(data, &s); err != nil {
+			return err
+		}
+
+		val, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return err
+		}
+
+		*f = JSONFloat64(val)
+
+		return nil
+	}
+
+	var fl float64
+	if err := json.Unmarshal(data, &fl); err != nil {
+		return err
+	}
+
+	*f = JSONFloat64(fl)
+
 	return nil
 }
 
-func (t Tstamp) UnmarshalBinarySize() int { return 8 }
+type JSONInt64 int64
 
-func (t Tstamp) MarshalBinary() ([]byte, error) {
-	out := []byte{0, 0, 0, 0, 0, 0, 0, 0}
-	binary.LittleEndian.PutUint64(out, uint64(t.UnixNano()))
-	return out, nil
+func (i *JSONInt64) UnmarshalJSON(data []byte) error {
+	if len(data) == 0 {
+		return errors.New("empty value")
+	}
+
+	if data[0] == '"' {
+		var s string
+		if err := json.Unmarshal(data, &s); err != nil {
+			return err
+		}
+
+		val, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			return err
+		}
+
+		*i = JSONInt64(val)
+
+		return nil
+	}
+
+	var v int64
+	if err := json.Unmarshal(data, &v); err != nil {
+		return err
+	}
+
+	*i = JSONInt64(v)
+
+	return nil
 }
