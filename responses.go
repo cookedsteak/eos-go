@@ -51,6 +51,11 @@ type BlockResp struct {
 	BlockExtensions []*Extension `json:"block_extensions"`
 }
 
+type ScheduledTransactionsResp struct {
+	Transactions []ScheduledTransaction `json:"transactions"`
+	More         string                 `json:"more"`
+}
+
 // type BlockTransaction struct {
 // 	Status        string            `json:"status"`
 // 	CPUUsageUS    int               `json:"cpu_usage_us"`
@@ -180,14 +185,16 @@ type CurrencyBalanceResp struct {
 }
 
 type GetTableRowsRequest struct {
-	JSON       bool   `json:"json"`
+	Code       string `json:"code"` // Contract "code" account where table lives
 	Scope      string `json:"scope"`
-	Code       string `json:"code"`
 	Table      string `json:"table"`
-	TableKey   string `json:"table_key"`
-	LowerBound string `json:"lower_bound"`
-	UpperBound string `json:"upper_bound"`
-	Limit      uint32 `json:"limit,omitempty"` // defaults to 10 => chain_plugin.hpp:struct get_table_rows_params
+	LowerBound string `json:"lower_bound,omitempty"`
+	UpperBound string `json:"upper_bound,omitempty"`
+	Limit      uint32 `json:"limit,omitempty"`          // defaults to 10 => chain_plugin.hpp:struct get_table_rows_params
+	KeyType    string `json:"key_type,omitempty"`       // The key type of --index, primary only supports (i64), all others support (i64, i128, i256, float64, float128, ripemd160, sha256). Special type 'name' indicates an account name.
+	Index      string `json:"index_position,omitempty"` // Index number, 1 - primary (first), 2 - secondary index (in order defined by multi_index), 3 - third index, etc. Number or name of index can be specified, e.g. 'secondary' or '2'.
+	EncodeType string `json:"encode_type,omitempty"`    // The encoding type of key_type (i64 , i128 , float64, float128) only support decimal encoding e.g. 'dec'" "i256 - supports both 'dec' and 'hex', ripemd160 and sha256 is 'hex' only
+	JSON       bool   `json:"json"`                     // JSON output if true, binary if false
 }
 
 type GetTableRowsResp struct {
@@ -230,6 +237,16 @@ func (resp *GetTableRowsResp) BinaryToStructs(v interface{}) error {
 	reflect.ValueOf(v).Elem().Set(outSlice)
 
 	return nil
+}
+
+type CreateSnapshotResp struct {
+	SnapshotName string `json:"snapshot_name"`
+	HeadBlockID  string `json:"head_block_id"`
+}
+
+type GetIntegrityHashResp struct {
+	HeadBlockID  string `json:"head_block_id"`
+	SnapshotName string `json:"integrity_hash"`
 }
 
 type Currency struct {

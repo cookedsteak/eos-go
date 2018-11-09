@@ -18,11 +18,13 @@ import (
 )
 
 type API struct {
-	HttpClient              *http.Client
-	BaseURL                 string
-	Signer                  Signer
-	Debug                   bool
-	Compress                CompressionType
+	HttpClient *http.Client
+	BaseURL    string
+	Signer     Signer
+	Debug      bool
+	Compress   CompressionType
+	// Header is one or more headers to be added to all outgoing calls
+	Header                  http.Header
 	DefaultMaxCPUUsageMS    uint8
 	DefaultMaxNetUsageWords uint32 // in 8-bytes words
 
@@ -52,6 +54,7 @@ func New(baseURL string) *API {
 		},
 		BaseURL:  baseURL,
 		Compress: CompressionZlib,
+		Header:   make(http.Header),
 	}
 
 	return api
@@ -109,6 +112,21 @@ func (api *API) SetSigner(s Signer) {
 // `producer_api` plugin loaded.
 func (api *API) ProducerPause() error {
 	return api.call("producer", "pause", nil, nil)
+}
+
+// CreateSnapshot will write a snapshot file on a nodeos with
+// `producer_api` plugin loaded.
+func (api *API) CreateSnapshot() (out *CreateSnapshotResp, err error) {
+	err = api.call("producer", "create_snapshot", nil, &out)
+	return
+}
+
+// GetIntegrityHash will produce a hash corresponding to current
+// state. Requires `producer_api` and useful when loading
+// from a snapshot
+func (api *API) GetIntegrityHash() (out *GetIntegrityHashResp, err error) {
+	err = api.call("producer", "get_integrity_hash", nil, &out)
+	return
 }
 
 // ProducerResume will resume block production on a nodeos with
@@ -366,6 +384,11 @@ func (api *API) PushTransaction(tx *PackedTransaction) (out *PushTransactionFull
 	return
 }
 
+func (api *API) PushTransactionRaw(tx *PackedTransaction) (out json.RawMessage, err error) {
+	err = api.call("chain", "push_transaction", tx, &out)
+	return
+}
+
 func (api *API) GetInfo() (out *InfoResp, err error) {
 	err = api.call("chain", "get_info", nil, &out)
 	return
@@ -418,6 +441,17 @@ func (api *API) GetNetStatus(host string) (out *NetStatusResp, err error) {
 func (api *API) GetBlockByID(id string) (out *BlockResp, err error) {
 	err = api.call("chain", "get_block", M{"block_num_or_id": id}, &out)
 	return
+}
+
+// GetScheduledTransactionsWithBounds returns scheduled transactions within specified bounds
+func (api *API) GetScheduledTransactionsWithBounds(lower_bound string, limit uint32) (out *ScheduledTransactionsResp, err error) {
+	err = api.call("chain", "get_scheduled_transactions", M{"json": true, "lower_bound": lower_bound, "limit": limit}, &out)
+	return
+}
+
+// GetScheduledTransactions returns the Top 100 scheduled transactions
+func (api *API) GetScheduledTransactions() (out *ScheduledTransactionsResp, err error) {
+	return api.GetScheduledTransactionsWithBounds("", 100)
 }
 
 func (api *API) GetProducers() (out *ProducersResp, err error) {
@@ -507,6 +541,13 @@ func (api *API) call(baseAPI string, endpoint string, body interface{}, out inte
 		return fmt.Errorf("NewRequest: %s", err)
 	}
 
+	for k, v := range api.Header {
+		if req.Header == nil {
+			req.Header = http.Header{}
+		}
+		req.Header[k] = append(req.Header[k], v...)
+	}
+
 	if api.Debug {
 		// Useful when debugging API calls
 		requestDump, err := httputil.DumpRequest(req, true)
@@ -531,10 +572,18 @@ func (api *API) call(baseAPI string, endpoint string, body interface{}, out inte
 	}
 
 	if resp.StatusCode == 404 {
-		return ErrNotFound
+		var apiErr APIError
+		if err := json.Unmarshal(cnt.Bytes(), &apiErr); err != nil {
+			return ErrNotFound
+		}
+		return apiErr
 	}
 	if resp.StatusCode > 299 {
-		return fmt.Errorf("%s: status code=%d, body=%s", req.URL.String(), resp.StatusCode, cnt.String())
+		var apiErr APIError
+		if err := json.Unmarshal(cnt.Bytes(), &apiErr); err != nil {
+			return fmt.Errorf("%s: status code=%d, body=%s", req.URL.String(), resp.StatusCode, cnt.String())
+		}
+		return apiErr
 	}
 
 	if api.Debug {
